@@ -1,0 +1,200 @@
+from flask import Flask, jsonify, request
+import random
+import threading
+import time
+from datetime import datetime
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
+import requests
+import joblib  # sklearn模型載入用
+import numpy as np
+
+app = Flask(__name__)
+
+# ========== 設定參數 ==========
+LINE_CHANNEL_ACCESS_TOKEN = '你的_LINE_CHANNEL_ACCESS_TOKEN'
+LINE_USER_ID = '你的_USER_ID'
+
+# ========== 初始化 ==========
+socket_status = {
+    "A": True,
+    "B": False,
+    "C": True
+}
+
+# 載入 sklearn 模型
+try:
+    model = joblib.load('your_model.pkl')  # 請確保模型是用 joblib 儲存的
+except Exception as e:
+    print("[模型載入失敗]:", e)
+    model = None
+
+# Line Bot 初始化
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+
+# ========== 工具函數 ==========
+def set_relay(name, status):
+    print(f"[模擬] 插座 {name} 已被 {'接通' if status else '斷電'}")
+
+def send_line_notify(user_id, message):
+    try:
+        line_bot_api.push_message(user_id, TextSendMessage(text=message))
+        print("[LINE Bot通知] 發送成功")
+    except Exception as e:
+        print("[LINE Bot通知] 發送失敗:", e)
+
+def ai_judge(current, magnitude):
+    if model is None:
+        return False
+    try:
+        features = np.array([[current, magnitude]])
+        prob = model.predict_proba(features)[0][1]  # 取得異常類別的機率
+        return prob > 0.5
+    except Exception as e:
+        print("[模型預測錯誤]:", e)
+        return False
+
+def generate_mock_data():
+    currents = {
+        "A": round(random.uniform(0.1, 0.4), 2),
+        "B": round(random.uniform(0.2, 0.6), 2),
+        "C": round(random.uniform(0.15, 1.2), 2),
+    }
+    magnitude = round(random.gauss(2.0, 1.0), 2)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return currents, magnitude, timestamp
+
+# ========== API 1：查詢插座狀態 ==========
+@app.route('/check_sockets', methods=['GET'])
+def check_sockets():
+    status_dict = {
+        f"{name}_socket": "ON" if status else "OFF"
+        for name, status in socket_status.items()
+    }
+    return jsonify(status_dict)
+
+# ========== API 2：模擬感測資料 ==========
+@app.route('/simulate_once', methods=['POST'])
+def simulate_once():
+    currents, magnitude, timestamp = generate_mock_data()
+    results = []
+
+    for name, current in currents.items():
+        if not socket_status[name]:
+            continue
+
+        is_abnormal = ai_judge(current, magnitude)
+        if is_abnormal:
+            socket_status[name] = False
+            set_relay(name, False)
+            send_line_notify(LINE_USER_ID, f"插座 {name} 出現異常，電流 {current}A，震度 {magnitude}，已斷電")
+
+        results.append({
+            "socket_name": name,
+            "time_stamp": timestamp,
+            "current_status": current,
+            "remarks": "異常!" if is_abnormal else "FUNCTION OK."
+        })
+
+    return jsonify(results)
+
+# ========== 背景模擬感測器資料 ==========
+def send_mock_data():
+    while True:
+        currents, magnitude, timestamp = generate_mock_data()
+
+        for name, current in currents.items():
+            if socket_status[name]:
+                is_abnormal = ai_judge(current, magnitude)
+                if is_abnormal:
+                    print(f"[警告] 插座 {name} 出現異常電流 {current}A，震度 {magnitude}")
+                    socket_status[name] = False
+                    set_relay(name, False)
+                    send_line_notify(LINE_USER_ID, f"警告！插座 {name} 異常，電流 {current}A，震度 {magnitude}，已斷電！")
+            else:
+                try:
+                    response = requests.post(
+                        "http://localhost:5000/risk_assessment",
+                        json={
+                            "socket_name": name,
+                            "current": current,
+                            "magnitude": magnitude,
+                            "timestamp": timestamp
+                        },
+                        timeout=5
+                    )
+                    result = response.json()
+                    if result.get("can_restore_power"):
+                        print(f"[訊息] 插座 {name} 風險評估安全，恢復供電")
+                        socket_status[name] = True
+                        set_relay(name, True)
+                        send_line_notify(LINE_USER_ID, f"插座 {name} 已恢復供電。")
+                    else:
+                        send_line_notify(LINE_USER_ID, f"插座 {name} 仍有風險，建議維持斷電。如需恢復供電，請用戶回覆指令。")
+                except Exception as e:
+                    print("[風險評估失敗]:", e)
+                    send_line_notify(LINE_USER_ID, f"風險評估失敗，插座 {name} 維持斷電。")
+
+            # 傳送資料到後台
+            data = {
+                "socket_name": name,
+                "time_stamp": timestamp,
+                "current_status": current,
+                "remarks": "異常!" if not socket_status[name] else "FUNCTION OK."
+            }
+            try:
+                r = requests.post("http://localhost:5000/receive_data", json=data)
+                r.raise_for_status()
+            except Exception as e:
+                print("[HTTP傳送失敗]:", e)
+
+            print("[Mock 傳送資料]", data)
+
+        time.sleep(5)
+
+# ========== API 3：切換插座開關 ==========
+@app.route('/switch', methods=['POST'])
+def switch_socket():
+    data = request.get_json()
+    target = data.get('target')
+    mode = data.get('mode')
+
+    if target not in socket_status or mode not in [0, 1]:
+        return jsonify({"error": "Invalid target or mode"}), 400
+
+    socket_status[target] = bool(mode)
+    set_relay(target, bool(mode))
+    return jsonify({"message": f"{target} is now {'ON' if mode else 'OFF'}."})
+
+# ========== API 4：地震警報 ==========
+@app.route('/earthquake_alert', methods=['GET'])
+def earthquake_alert():
+    magnitude = round(random.uniform(1.0, 7.9), 1)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    for name in socket_status:
+        socket_status[name] = False
+        set_relay(name, False)
+
+    print("[地震警報] 偵測到震度：", magnitude)
+    print("所有插座已斷開電源")
+
+    return jsonify({
+        "magnitude": magnitude,
+        "timestamp": timestamp,
+        **{f"{name}_socket_status": "ON" if status else "OFF" for name, status in socket_status.items()}
+    })
+
+# ========== API 5：接收模擬資料儲存 ==========
+@app.route('/receive_data', methods=['POST'])
+def receive_data():
+    data = request.get_json()
+    print("[收到資料]", data)
+    return jsonify({"message": "資料接收成功"})
+
+# ========== 啟動背景執行緒 ==========
+threading.Thread(target=send_mock_data, daemon=True).start()
+
+# ========== 啟動 Flask ==========
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)#flask port

@@ -1,0 +1,128 @@
+import random
+import time
+from datetime import datetime
+from flask import Flask, request, jsonify
+import RPi.GPIO as GPIO
+import joblib  # 用來載入 sklearn 模型
+
+app = Flask(__name__)
+
+# 繼電器腳位設定 (模擬 A/B/C 三個插座開關的gpio)
+relay_pins = {
+    "A": 17,
+    "B": 27,
+    "C": 22
+}
+
+# line webhook資料路由
+@app.route("/line_webhook", methods=["POST"])
+def line_webhook():
+    payload = request.get_json()
+    print("[LINE Webhook 收到訊息]：", payload)
+    return "OK"
+
+# 初始化GPIO
+GPIO.setmode(GPIO.BCM)
+for pin in relay_pins.values():
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.HIGH)  # 預設插座通電
+
+# 插座狀態初始值
+socket_status = {
+    "A": True,
+    "B": True,
+    "C": True
+}
+
+# 載入 sklearn 模型
+try:
+    model = joblib.load("rf_model.pkl")  # 假設檔案名稱為 rf_model.pkl
+except Exception as e:
+    print("模型載入失敗:", e)
+    model = None
+
+# 設定繼電器開關
+def set_relay(socket_name, on_off):
+    pin = relay_pins[socket_name]
+    GPIO.output(pin, GPIO.HIGH if on_off else GPIO.LOW)
+    print(f"[繼電器] {socket_name} => {'接通' if on_off else '斷開'}")
+
+# 隨機產生電流與震度模擬信號
+def simulate_data():
+    result = []
+    for name in ["A", "B", "C"]:
+        current = round(random.uniform(0.1, 1.5), 2)
+        magnitude = round(random.uniform(0.0, 8.0), 1)
+        result.append((name, current, magnitude))
+    return result
+
+# 用 sklearn 模型預測
+def ai_predict(current, magnitude):
+    if model:
+        input_data = [[current, magnitude]]
+        prediction = model.predict(input_data)[0]
+        return prediction == 1  # 假設異常為1，正常為0
+    else:
+        return random.random() < 0.1  # 沒模型時預設10%異常率
+
+@app.route('/check_sockets', methods=['GET'])
+def check_sockets():
+    response = {
+        "A_socket": "ON" if socket_status["A"] else "OFF",
+        "B_socket": "ON" if socket_status["B"] else "OFF",
+        "C_socket": "ON" if socket_status["C"] else "OFF"
+    }
+    return jsonify(response)
+
+@app.route('/switch', methods=['POST'])
+def switch_socket():
+    data = request.get_json()
+    target = data.get('target')
+    mode = data.get('mode')  # 0: 斷開, 1: 接通
+
+    if target not in socket_status or mode not in [0, 1]:
+        return jsonify({"error": "Invalid target or mode"}), 400
+
+    socket_status[target] = bool(mode)
+    set_relay(target, bool(mode))
+    return jsonify({"message": f"{target} is now {'ON' if mode else 'OFF'}."})
+
+@app.route('/receive_data', methods=['GET'])
+def receive_data():
+    simulated = simulate_data()
+    result = []
+
+    for name, current, magnitude in simulated:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        is_abnormal = ai_predict(current, magnitude)
+
+        if is_abnormal:
+            socket_status[name] = False
+            set_relay(name, False)
+            print(f"[警告] 插座 {name} 出現異常電流 {current}A，震度 {magnitude}")
+
+        result.append({
+            "socket_name": name,
+            "time_stamp": timestamp,
+            "current": current,
+            "magnitude": magnitude,
+            "status": "OFF" if socket_status[name] == False else "ON",
+            "remarks": "異常" if is_abnormal else "正常"
+        })
+
+    return jsonify(result)
+
+@app.route('/earthquake_alert', methods=['GET'])
+def earthquake_alert():
+    magnitude = round(random.uniform(1.0, 7.9), 1)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return jsonify({
+        "magnitude": magnitude,
+        "timestamp": timestamp
+    })
+
+if __name__ == '__main__':
+    try:
+        app.run(host='0.0.0.0', port=5000)#flask port
+    except KeyboardInterrupt:
+        GPIO.cleanup()

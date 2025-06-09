@@ -1,0 +1,80 @@
+from flask import Flask, request, jsonify
+import threading
+import time
+import datetime
+import requests
+import random
+
+app = Flask(__name__)
+
+# 模擬插座電源狀態
+socket_status = {
+    'A': True,   # True = ON
+    'B': False,
+    'C': True
+}
+
+# 以背景執行緒持續執行，每 10 秒一次去模擬偶發事件（強震）
+def detect_earthquake():
+    while True:
+        time.sleep(10)
+        magnitude = round(random.uniform(6.0, 8.0), 1)
+        if magnitude >= 7.0:
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            data = {
+                "magnitude": magnitude,
+                "timestamp": timestamp
+            }
+            try:
+                requests.post("https://你的Ngrok網址/earthquake_alert", json=data)
+                print(f"地震通報已送出：{data}")
+            except Exception as e:
+                print("無法發送地震警報：", e)
+
+# 每 5 秒就回傳電流資料
+def send_current_data():
+    while True:
+        for socket_name, status in socket_status.items():
+            if status:
+                current = round(random.uniform(0.1, 0.5), 2)
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                payload = {
+                    "socket_name": socket_name,
+                    "time_stamp": timestamp,
+                    "current_status": str(current),
+                    "remarks": "FUNCTION OK."
+                }
+                try:
+                    requests.post("https://你的Ngrok網址/receive_data", json=payload)
+                    print(f"電流資料已送出：{payload}")
+                except Exception as e:
+                    print("無法發送電流資料：", e)
+        time.sleep(5)
+
+#查詢插座狀態
+@app.route('/check_sockets', methods=['GET'])
+def check_sockets():
+    return jsonify({
+        "A_socket": "ON" if socket_status['A'] else "OFF",
+        "B_socket": "ON" if socket_status['B'] else "OFF",
+        "C_socket": "ON" if socket_status['C'] else "OFF"
+    })
+
+#切換插座通電
+@app.route('/switch', methods=['POST'])
+def switch_socket():
+    data = request.get_json()
+    socket_name = data.get('target')
+    mode = data.get('mode')
+
+    if socket_name not in socket_status or mode not in [0, 1]:
+        return jsonify({"status": "error", "message": "Invalid input"}), 400
+
+    socket_status[socket_name] = True if mode == 1 else False
+    print(f"插座 {socket_name} 設定為 {'ON' if mode == 1 else 'OFF'}")
+    return jsonify({"status": "success", "socket": socket_name, "new_mode": "ON" if mode == 1 else "OFF"})
+
+if __name__ == '__main__':
+    threading.Thread(target=send_current_data, daemon=True).start()
+    threading.Thread(target=detect_earthquake, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000)#flask port
